@@ -6,8 +6,9 @@
 # the target repo (or pass --repo-dir). It will:
 #   1. Check prerequisites (git, gh, gh login)
 #   2. Copy agent-fix.yml into the repo's .github/workflows/ and check it's valid YAML
-#   3. Check the secrets it uses exist in the repo (offers to set missing ones)
-#   4. Check the Claude GitHub App is installed on the repo
+#   3. Check the Claude GitHub App is installed (opens the install page if not)
+#   4. Check the secrets it uses (offers to set missing ones, incl. Claude API key
+#      or a Pro/Max subscription token via `claude setup-token`)
 #   5. Create the trigger label if it doesn't exist
 #   6. If it calls a reusable workflow in another repo, check that's reachable
 #   7. Commit and push the workflow to the default branch
@@ -16,7 +17,7 @@
 # Usage:
 #   scripts/setup-agent-fix.sh [--repo-dir DIR] [--workflow PATH] [--label NAME] [--test] [--yes]
 #
-# Requires: git, gh (logged in with `gh auth login`). python3 + PyYAML optional.
+# Requires: git, gh (logged in with `gh auth login`). Optional: python3 + PyYAML, claude.
 
 set -euo pipefail
 
@@ -47,7 +48,7 @@ confirm() {
   [[ "$reply" =~ ^[Yy]$ ]]
 }
 
-usage() { sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
+usage() { sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
 # ---------- args ----------
 while [[ $# -gt 0 ]]; do
@@ -127,83 +128,164 @@ else
   warn "Couldn't find a 'label.name == ...' condition. Pass --label NAME to create the label."
 fi
 
-# ---------- 3. secrets ----------
+# ---------- 3. Claude GitHub App ----------
+step "Checking the Claude GitHub App is installed on $REPO"
+APP_INSTALL_URL="https://github.com/apps/claude/installations/select_target"
+
+# Prints 'yes', 'no', or 'unknown' (gh token can't list app installations)
+claude_app_status() {
+  local ids id
+  ids=$(gh api --paginate user/installations \
+          -q '.installations[] | select(.app_slug == "claude") | .id' 2>/dev/null) || { echo unknown; return; }
+  for id in $ids; do
+    if gh api --paginate "user/installations/$id/repositories" -q '.repositories[].full_name' 2>/dev/null \
+         | grep -qixF "$REPO"; then
+      echo yes; return
+    fi
+  done
+  echo no
+}
+
+open_url() {
+  local opener
+  for opener in xdg-open open wslview; do
+    command -v "$opener" >/dev/null && { "$opener" "$1" >/dev/null 2>&1 & return 0; }
+  done
+  return 1
+}
+
+APP_STATUS=$(claude_app_status)
+if [[ "$APP_STATUS" == "yes" ]]; then
+  ok "Claude GitHub App has access to $REPO"
+elif [[ $ASSUME_YES -eq 1 ]]; then
+  # Installing an app needs a person to approve it in the browser
+  warn "Claude GitHub App not confirmed on $REPO. Install it: $APP_INSTALL_URL"
+else
+  if [[ "$APP_STATUS" == "no" ]]; then
+    echo "  The Claude GitHub App doesn't have access to $REPO yet."
+  else
+    echo "  Couldn't check app installations with your gh token."
+  fi
+  echo "  Installing a GitHub App needs your approval in the browser:"
+  echo "    1. Pick the account/org that owns $REPO"
+  echo "    2. Choose 'Only select repositories' and add ${REPO#*/} (or keep 'All repositories')"
+  echo "    3. Click Install / Save"
+  if confirm "Open $APP_INSTALL_URL now?"; then
+    open_url "$APP_INSTALL_URL" || echo "  Couldn't open a browser — go to: $APP_INSTALL_URL"
+    read -r -p "  Press Enter once you've installed it... " _
+    APP_STATUS=$(claude_app_status)
+    case "$APP_STATUS" in
+      yes)     ok "Claude GitHub App now has access to $REPO" ;;
+      no)      warn "Still no access to $REPO — check the repo is selected in the app's settings" ;;
+      unknown) ok "Can't verify with your gh token; assuming you installed it" ;;
+    esac
+  else
+    warn "Skipped. Install later: $APP_INSTALL_URL"
+  fi
+fi
+
+# ---------- 4. secrets ----------
 step "Checking repository secrets"
-REPO_SECRETS=$(gh secret list --repo "$REPO" --json name -q '.[].name' 2>/dev/null || true)
-ORG_SECRETS=$(gh secret list --org "$OWNER" --json name -q '.[].name' 2>/dev/null || true)
-ALL_SECRETS=$(printf '%s\n%s\n' "$REPO_SECRETS" "$ORG_SECRETS")
+load_secrets() {
+  local repo_s org_s
+  repo_s=$(gh secret list --repo "$REPO" --json name -q '.[].name' 2>/dev/null || true)
+  org_s=$(gh secret list --org "$OWNER" --json name -q '.[].name' 2>/dev/null || true)
+  ALL_SECRETS=$(printf '%s\n%s\n' "$repo_s" "$org_s")
+}
+load_secrets
 
 has_secret() { grep -qxF "$1" <<<"$ALL_SECRETS"; }
 
+# Replace one secret name with another in the workflow file
+rewrite_secret_ref() {
+  sed -i.bak "s/secrets\.$1\([^A-Za-z0-9_]\)/secrets.$2\1/g" "$WORKFLOW" && rm -f "$WORKFLOW.bak"
+}
+
+# Switch the claude-code-action input from an API key to a subscription OAuth token
+use_oauth_token_in_workflow() {
+  sed -i.bak 's/anthropic_api_key: *\${{ *secrets\.ANTHROPIC_API_KEY *}}/claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}/' \
+    "$WORKFLOW" && rm -f "$WORKFLOW.bak"
+}
+
 offer_set_secret() {
   local name="$1"
-  if confirm "Set $name now? (value is read from your terminal, not echoed)"; then
+  if confirm "Set $name now? (you'll paste the value; it isn't echoed)"; then
     gh secret set "$name" --repo "$REPO" && ok "$name set"
   else
     warn "$name is missing — the workflow will fail without it"
   fi
 }
 
+# Claude credentials: an API key (pay per use) or a Pro/Max subscription token
+setup_claude_credentials() {
+  if has_secret CLAUDE_CODE_OAUTH_TOKEN; then
+    if confirm "Found CLAUDE_CODE_OAUTH_TOKEN. Use it (your Claude subscription) instead of ANTHROPIC_API_KEY?"; then
+      use_oauth_token_in_workflow; ok "Workflow now uses CLAUDE_CODE_OAUTH_TOKEN"; return
+    fi
+  fi
+  if [[ $ASSUME_YES -eq 1 ]]; then
+    warn "No Claude credentials secret. Set one: gh secret set ANTHROPIC_API_KEY --repo $REPO"; return
+  fi
+  echo "  No Claude credentials found. How should the workflow authenticate?"
+  echo "    1) Anthropic API key (pay per use, from console.anthropic.com)"
+  echo "    2) Claude Pro/Max subscription token (generated with 'claude setup-token')"
+  echo "    3) Skip for now"
+  local choice; read -r -p "  Choice [1-3]: " choice
+  case "$choice" in
+    1)
+      gh secret set ANTHROPIC_API_KEY --repo "$REPO" && ok "ANTHROPIC_API_KEY set" ;;
+    2)
+      if command -v claude >/dev/null; then
+        echo "  Running 'claude setup-token' — log in, then copy the token it prints."
+        claude setup-token || true
+      else
+        echo "  Claude Code isn't installed here. Run 'claude setup-token' on a machine that has it,"
+        echo "  or install it: https://docs.claude.com/en/docs/claude-code/setup"
+      fi
+      echo "  Paste the token below."
+      if gh secret set CLAUDE_CODE_OAUTH_TOKEN --repo "$REPO"; then
+        ok "CLAUDE_CODE_OAUTH_TOKEN set"
+        use_oauth_token_in_workflow; ok "Workflow now uses CLAUDE_CODE_OAUTH_TOKEN"
+      fi ;;
+    *)
+      warn "No Claude credentials — the workflow will fail until you add one" ;;
+  esac
+}
+
 NEEDED_SECRETS=$(grep -oE 'secrets\.[A-Za-z0-9_]+' "$WORKFLOW" | sed 's/secrets\.//' \
                  | grep -vx 'GITHUB_TOKEN' | sort -u || true)
+# With `secrets: inherit` the names aren't in the file, so always check Claude credentials
+grep -q 'secrets: *inherit' "$WORKFLOW" && NEEDED_SECRETS=$(printf '%s\nANTHROPIC_API_KEY\n' "$NEEDED_SECRETS")
 
-if [[ -n "$NEEDED_SECRETS" ]]; then
-  while read -r s; do
-    [[ -z "$s" ]] && continue
-    if has_secret "$s"; then ok "$s exists"; continue; fi
-    # `firebase init hosting:github` names the secret FIREBASE_SERVICE_ACCOUNT_<PROJECT>
-    if [[ "$s" == "FIREBASE_SERVICE_ACCOUNT" ]]; then
+# Loop on fd 3 so prompts inside it (confirm, gh secret set) still read from the terminal
+while read -r s <&3; do
+  [[ -z "$s" ]] && continue
+  if has_secret "$s"; then ok "$s exists"; continue; fi
+  case "$s" in
+    ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN)
+      if has_secret ANTHROPIC_API_KEY || has_secret CLAUDE_CODE_OAUTH_TOKEN; then
+        # The other kind of credential exists; point the workflow at it
+        if [[ "$s" == ANTHROPIC_API_KEY ]]; then use_oauth_token_in_workflow; other=CLAUDE_CODE_OAUTH_TOKEN
+        else rewrite_secret_ref CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY
+             sed -i.bak 's/claude_code_oauth_token:/anthropic_api_key:/' "$WORKFLOW" && rm -f "$WORKFLOW.bak"
+             other=ANTHROPIC_API_KEY; fi
+        ok "Using existing $other for Claude"
+      else
+        setup_claude_credentials
+      fi ;;
+    FIREBASE_SERVICE_ACCOUNT)
+      # `firebase init hosting:github` names it FIREBASE_SERVICE_ACCOUNT_<PROJECT>
       alt=$(grep -m1 '^FIREBASE_SERVICE_ACCOUNT_' <<<"$ALL_SECRETS" || true)
-      if [[ -n "$alt" ]] && confirm "Found secret $alt. Use it in the workflow instead of $s?"; then
-        sed -i.bak "s/secrets\.$s\([^A-Za-z0-9_]\)/secrets.$alt\1/g" "$WORKFLOW" && rm -f "$WORKFLOW.bak"
-        ok "Workflow now uses $alt"
-        continue
-      fi
-    fi
-    warn "$s not found"; offer_set_secret "$s"
-  done <<<"$NEEDED_SECRETS"
-fi
-
-# Claude auth: either key works. With `secrets: inherit` names aren't in the file, so check anyway.
-if has_secret ANTHROPIC_API_KEY || has_secret CLAUDE_CODE_OAUTH_TOKEN; then
-  ok "Claude credentials present (ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN)"
-elif ! grep -qE 'ANTHROPIC_API_KEY|CLAUDE_CODE_OAUTH_TOKEN' <<<"$NEEDED_SECRETS"; then
-  warn "No ANTHROPIC_API_KEY or CLAUDE_CODE_OAUTH_TOKEN secret found"
-  offer_set_secret ANTHROPIC_API_KEY
-fi
-
-if grep -q 'action-hosting-deploy' "$WORKFLOW" || grep -q 'secrets: *inherit' "$WORKFLOW"; then
-  if grep -q '^FIREBASE_SERVICE_ACCOUNT' <<<"$ALL_SECRETS"; then
-    ok "Firebase service account secret present"
-  else
-    warn "No FIREBASE_SERVICE_ACCOUNT* secret. Create one with: firebase init hosting:github"
-  fi
-fi
-
-# ---------- 4. Claude GitHub App ----------
-step "Checking the Claude GitHub App is installed on $REPO"
-APP_CHECKED=0
-if INSTALL_IDS=$(gh api --paginate user/installations \
-      -q '.installations[] | select(.app_slug == "claude") | .id' 2>/dev/null); then
-  APP_CHECKED=1
-  FOUND_APP=0
-  for id in $INSTALL_IDS; do
-    if gh api --paginate "user/installations/$id/repositories" -q '.repositories[].full_name' 2>/dev/null \
-         | grep -qixF "$REPO"; then
-      FOUND_APP=1; break
-    fi
-  done
-  if [[ $FOUND_APP -eq 1 ]]; then
-    ok "Claude GitHub App has access to $REPO"
-  else
-    warn "Claude GitHub App doesn't have access to $REPO."
-    echo "      Install/configure it: https://github.com/apps/claude/installations/select_target"
-  fi
-fi
-if [[ $APP_CHECKED -eq 0 ]]; then
-  warn "Couldn't check app installations with your gh token. Verify manually:"
-  echo "      https://github.com/apps/claude/installations/select_target"
-fi
+      if [[ -n "$alt" ]]; then
+        rewrite_secret_ref "$s" "$alt"; ok "Using existing $alt for Firebase"
+      else
+        warn "$s not found. Easiest: run 'firebase init hosting:github' in this repo, then rerun this script."
+        offer_set_secret "$s"
+      fi ;;
+    *)
+      warn "$s not found"; offer_set_secret "$s" ;;
+  esac
+done 3<<<"$NEEDED_SECRETS"
 
 # ---------- 5. label ----------
 if [[ -n "$LABEL" ]]; then
