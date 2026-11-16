@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 #
-# setup-agent-fix.sh — check, commit and push a label-triggered Claude workflow.
+# setup-agent-fix.sh — install, check, commit and push a label-triggered Claude workflow.
 #
-# Run it from inside the target repo (or pass --repo-dir). It will:
+# Expects agent-fix.yml in the same folder as this script. Run it from inside
+# the target repo (or pass --repo-dir). It will:
 #   1. Check prerequisites (git, gh, gh login)
-#   2. Check the workflow file exists and is valid YAML
+#   2. Copy agent-fix.yml into the repo's .github/workflows/ and check it's valid YAML
 #   3. Check the secrets it uses exist in the repo (offers to set missing ones)
 #   4. Check the Claude GitHub App is installed on the repo
 #   5. Create the trigger label if it doesn't exist
@@ -19,6 +20,8 @@
 
 set -euo pipefail
 
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+SOURCE_WORKFLOW="$SCRIPT_DIR/agent-fix.yml"
 REPO_DIR="."
 WORKFLOW=".github/workflows/agent-fix.yml"
 LABEL=""
@@ -77,9 +80,26 @@ OWNER="${REPO%%/*}"
 ok "Repo: $REPO (default branch: $DEFAULT_BRANCH)"
 
 # ---------- 2. workflow file ----------
-step "Checking workflow file"
-[[ -f "$WORKFLOW" ]] || fail "Workflow file not found: $WORKFLOW"
-ok "Found $WORKFLOW"
+step "Installing workflow file"
+[[ -f "$SOURCE_WORKFLOW" ]] || fail "Template not found: $SOURCE_WORKFLOW (put agent-fix.yml next to this script)"
+WORKFLOW_ACTION="Add"
+if [[ ! -f "$WORKFLOW" ]]; then
+  mkdir -p "$(dirname "$WORKFLOW")"
+  cp "$SOURCE_WORKFLOW" "$WORKFLOW"
+  ok "Copied $SOURCE_WORKFLOW → $WORKFLOW"
+elif cmp -s "$SOURCE_WORKFLOW" "$WORKFLOW"; then
+  ok "$WORKFLOW is already identical to the template"
+else
+  warn "$WORKFLOW already exists and differs from the template:"
+  diff -u "$WORKFLOW" "$SOURCE_WORKFLOW" | sed 's/^/      /' || true
+  if confirm "Overwrite it with the template?"; then
+    cp "$SOURCE_WORKFLOW" "$WORKFLOW"
+    WORKFLOW_ACTION="Update"
+    ok "Overwrote $WORKFLOW"
+  else
+    ok "Keeping the existing $WORKFLOW"
+  fi
+fi
 
 if command -v python3 >/dev/null && python3 -c 'import yaml' 2>/dev/null; then
   if python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "$WORKFLOW" 2>/tmp/yaml_err.$$; then
@@ -130,7 +150,17 @@ NEEDED_SECRETS=$(grep -oE 'secrets\.[A-Za-z0-9_]+' "$WORKFLOW" | sed 's/secrets\
 if [[ -n "$NEEDED_SECRETS" ]]; then
   while read -r s; do
     [[ -z "$s" ]] && continue
-    if has_secret "$s"; then ok "$s exists"; else warn "$s not found"; offer_set_secret "$s"; fi
+    if has_secret "$s"; then ok "$s exists"; continue; fi
+    # `firebase init hosting:github` names the secret FIREBASE_SERVICE_ACCOUNT_<PROJECT>
+    if [[ "$s" == "FIREBASE_SERVICE_ACCOUNT" ]]; then
+      alt=$(grep -m1 '^FIREBASE_SERVICE_ACCOUNT_' <<<"$ALL_SECRETS" || true)
+      if [[ -n "$alt" ]] && confirm "Found secret $alt. Use it in the workflow instead of $s?"; then
+        sed -i.bak "s/secrets\.$s\([^A-Za-z0-9_]\)/secrets.$alt\1/g" "$WORKFLOW" && rm -f "$WORKFLOW.bak"
+        ok "Workflow now uses $alt"
+        continue
+      fi
+    fi
+    warn "$s not found"; offer_set_secret "$s"
   done <<<"$NEEDED_SECRETS"
 fi
 
@@ -177,13 +207,20 @@ fi
 
 # ---------- 5. label ----------
 if [[ -n "$LABEL" ]]; then
-  step "Checking label '$LABEL'"
-  if gh label list --repo "$REPO" --limit 500 --json name -q '.[].name' | grep -qxF "$LABEL"; then
-    ok "Label exists"
-  else
-    gh label create "$LABEL" --repo "$REPO" --color 7057ff \
-      --description "Ask Claude to attempt a fix" >/dev/null
-    ok "Created label '$LABEL'"
+  step "Checking labels"
+  EXISTING_LABELS=$(gh label list --repo "$REPO" --limit 500 --json name -q '.[].name')
+  ensure_label() {  # name color description
+    if grep -qxF "$1" <<<"$EXISTING_LABELS"; then
+      ok "Label '$1' exists"
+    else
+      gh label create "$1" --repo "$REPO" --color "$2" --description "$3" >/dev/null
+      ok "Created label '$1'"
+    fi
+  }
+  ensure_label "$LABEL" 7057ff "Ask Claude to attempt a fix"
+  # Claude adds this when an issue is too complex to fix automatically
+  if grep -q 'needs-human' "$WORKFLOW"; then
+    ensure_label needs-human d93f0b "Claude decided this needs a human"
   fi
 fi
 
@@ -230,7 +267,7 @@ git add "$WORKFLOW"
 if git diff --cached --quiet -- "$WORKFLOW"; then
   ok "No changes to commit in $WORKFLOW"
 else
-  git commit -m "Add Claude agent fix workflow" -- "$WORKFLOW" >/dev/null
+  git commit -m "$WORKFLOW_ACTION Claude agent fix workflow" -- "$WORKFLOW" >/dev/null
   ok "Committed $WORKFLOW"
 fi
 
