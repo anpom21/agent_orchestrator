@@ -5,9 +5,13 @@
 #     deploys a Firebase Hosting preview channel and comments the URL on the issue, or
 #   - labels the issue `needs-human` with a short explanation and changes nothing.
 #
-# Secrets needed in the repo: ANTHROPIC_API_KEY, FIREBASE_SERVICE_ACCOUNT
-# Assumes a Node project built with `npm ci && npm run build` and a .firebaserc
-# in the repo root. Adjust the build step if your project differs.
+# Secrets needed in the repo: ANTHROPIC_API_KEY (or CLAUDE_CODE_OAUTH_TOKEN),
+# and FIREBASE_SERVICE_ACCOUNT if the repo has a firebase.json.
+#
+# Build: set BUILD_COMMAND below for a custom build. Left empty, it auto-detects:
+#   package.json with a "build" script → npm ci / npm install, then npm run build
+#   anything else                       → no build (e.g. a plain static site)
+# Preview: only deployed if the repo has a firebase.json.
 
 name: Claude agent fix
 
@@ -33,6 +37,7 @@ jobs:
       ISSUE_NUMBER: ${{ github.event.issue.number }}
       BRANCH: claude/issue-${{ github.event.issue.number }}
       GH_TOKEN: ${{ github.token }}
+      BUILD_COMMAND: ""   # e.g. "flutter build web" or "make build"; empty = auto-detect
     steps:
       - uses: actions/checkout@v4
         with:
@@ -58,7 +63,10 @@ jobs:
             If SIMPLE:
               1. git checkout -b claude/issue-${{ github.event.issue.number }}
               2. Make the fix. Do not touch .github/ or any secrets/config files.
-              3. Run `npm ci && npm run build` and make sure it passes.
+              3. If the project has a build or tests, run them the way the repo
+                 does (check BUILD_COMMAND="${{ env.BUILD_COMMAND }}", package.json
+                 scripts, Makefile, README) and make sure they pass. If there is
+                 nothing to build, skip this.
               4. Commit, then: git push -u origin claude/issue-${{ github.event.issue.number }}
               5. Open a PR with `gh pr create` whose body includes "Fixes #${{ github.event.issue.number }}".
 
@@ -75,6 +83,11 @@ jobs:
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
           fi
+          if [ -f firebase.json ]; then
+            echo "firebase=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "firebase=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Check out the fix branch
         if: steps.branch.outputs.exists == 'true'
@@ -83,11 +96,20 @@ jobs:
           git checkout -B "$BRANCH" "origin/$BRANCH"
 
       - name: Build
-        if: steps.branch.outputs.exists == 'true'
-        run: npm ci && npm run build
+        if: steps.branch.outputs.exists == 'true' && steps.branch.outputs.firebase == 'true'
+        run: |
+          if [ -n "$BUILD_COMMAND" ]; then
+            echo "Running BUILD_COMMAND: $BUILD_COMMAND"
+            bash -c "$BUILD_COMMAND"
+          elif [ -f package.json ] && node -e "process.exit(require('./package.json').scripts?.build ? 0 : 1)"; then
+            if [ -f package-lock.json ]; then npm ci; else npm install; fi
+            npm run build
+          else
+            echo "No build step detected — deploying files as they are."
+          fi
 
       - name: Deploy Firebase preview channel
-        if: steps.branch.outputs.exists == 'true'
+        if: steps.branch.outputs.exists == 'true' && steps.branch.outputs.firebase == 'true'
         id: preview
         uses: FirebaseExtended/action-hosting-deploy@v0
         with:
@@ -96,15 +118,18 @@ jobs:
           channelId: issue-${{ github.event.issue.number }}
           expires: 7d
 
-      - name: Comment preview URL on the issue
+      - name: Comment on the issue
         if: steps.branch.outputs.exists == 'true'
         env:
           PREVIEW_URL: ${{ steps.preview.outputs.details_url }}
         run: |
           PR_URL=$(gh pr list --head "$BRANCH" --json url -q '.[0].url' || true)
+          if [ -n "$PREVIEW_URL" ]; then
+            PREVIEW_LINE="- Preview (expires in 7 days): $PREVIEW_URL"
+          else
+            PREVIEW_LINE="- No preview: this repo has no firebase.json"
+          fi
           gh issue comment "$ISSUE_NUMBER" --body "Claude made a fix.
 
-          - Preview: $PREVIEW_URL
-          - Pull request: ${PR_URL:-not found (branch: $BRANCH)}
-
-          The preview expires in 7 days."
+          $PREVIEW_LINE
+          - Pull request: ${PR_URL:-not found (branch: $BRANCH)}"

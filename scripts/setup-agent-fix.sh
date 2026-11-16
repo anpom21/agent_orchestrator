@@ -276,7 +276,9 @@ while read -r s <&3; do
     FIREBASE_SERVICE_ACCOUNT)
       # `firebase init hosting:github` names it FIREBASE_SERVICE_ACCOUNT_<PROJECT>
       alt=$(grep -m1 '^FIREBASE_SERVICE_ACCOUNT_' <<<"$ALL_SECRETS" || true)
-      if [[ -n "$alt" ]]; then
+      if [[ ! -f firebase.json ]]; then
+        ok "No firebase.json in this repo — previews will be skipped, so no Firebase secret needed"
+      elif [[ -n "$alt" ]]; then
         rewrite_secret_ref "$s" "$alt"; ok "Using existing $alt for Firebase"
       else
         warn "$s not found. Easiest: run 'firebase init hosting:github' in this repo, then rerun this script."
